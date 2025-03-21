@@ -4,6 +4,7 @@ import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
+import fetch from "node-fetch";
 
 /**
  * Google Ads API Query Tool
@@ -21,8 +22,8 @@ interface GoogleAdsConfig {
     client_id: string;
     client_secret: string;
     refresh_token?: string;
+    customer_id?: string;
     login_customer_id?: string;
-    linked_customer_id?: string;
 }
 
 // Default configuration (will be loaded from .env or user input)
@@ -31,8 +32,8 @@ const config: GoogleAdsConfig = {
     client_id: process.env.GOOGLE_ADS_CLIENT_ID || "",
     client_secret: process.env.GOOGLE_ADS_CLIENT_SECRET || "",
     refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN || "",
+    customer_id: process.env.GOOGLE_ADS_CUSTOMER_ID || "",
     login_customer_id: process.env.GOOGLE_ADS_LOGIN_CUSTOMER_ID || "",
-    linked_customer_id: process.env.GOOGLE_ADS_LINKED_CUSTOMER_ID || "",
 };
 
 // Create readline interface for user input
@@ -45,12 +46,7 @@ const rl = readline.createInterface({
  * Prompts the user for missing configuration values
  */
 async function promptForMissingConfig(): Promise<void> {
-    const requiredFields: (keyof GoogleAdsConfig)[] = [
-        "developer_token",
-        "client_id",
-        "client_secret",
-        "login_customer_id",
-    ];
+    const requiredFields: (keyof GoogleAdsConfig)[] = ["developer_token", "client_id", "client_secret"];
 
     for (const field of requiredFields) {
         if (!config[field]) {
@@ -84,13 +80,30 @@ async function promptForMissingConfig(): Promise<void> {
         }
     }
 
-    // Ask for linked customer ID if not provided
-    if (!config.linked_customer_id) {
-        config.linked_customer_id = await new Promise((resolve) => {
+    // Ask for customer ID if not provided
+    if (!config.customer_id) {
+        config.customer_id = await new Promise((resolve) => {
             rl.question("Please enter the customer ID you want to query (without dashes): ", (answer) => {
                 resolve(answer);
             });
         });
+    }
+
+    // Ask for login customer ID (optional)
+    if (!config.login_customer_id) {
+        const useLoginId = await new Promise<string>((resolve) => {
+            rl.question("Do you want to specify a login customer ID? (yes/no): ", (answer) => {
+                resolve(answer.toLowerCase());
+            });
+        });
+
+        if (useLoginId === "yes" || useLoginId === "y") {
+            config.login_customer_id = await new Promise((resolve) => {
+                rl.question("Please enter the login customer ID: ", (answer) => {
+                    resolve(answer);
+                });
+            });
+        }
     }
 
     // Save config to .env file
@@ -235,18 +248,62 @@ function initializeClient(): GoogleAdsApi {
 }
 
 /**
+ * Creates a customer instance based on configuration
+ */
+function createCustomerInstance(client: GoogleAdsApi) {
+    const customerConfig: any = {
+        customer_id: config.customer_id!,
+        refresh_token: config.refresh_token!,
+    };
+
+    // Add optional parameters if they exist
+    if (config.login_customer_id) {
+        customerConfig.login_customer_id = config.login_customer_id;
+    }
+
+    return client.Customer(customerConfig);
+}
+
+/**
+ * Lists accessible customers for the authenticated user
+ */
+async function listAccessibleCustomers(): Promise<void> {
+    try {
+        const client = initializeClient();
+        console.log("\nListing accessible customer accounts...");
+
+        const response = await client.listAccessibleCustomers(config.refresh_token!);
+
+        // The response is expected to have a 'resource_names' array
+        if (response && response.resource_names && response.resource_names.length > 0) {
+            console.log(`\n✅ Found ${response.resource_names.length} accessible customer accounts:`);
+            response.resource_names.forEach((resourceName: string, index: number) => {
+                // Extract customer ID from resource name (format: customers/1234567890)
+                const customerId = resourceName.split("/")[1];
+                console.log(`${index + 1}. Customer ID: ${customerId}`);
+            });
+        } else {
+            console.log("\n⚠️ No accessible customer accounts found.");
+        }
+    } catch (error) {
+        console.error("\n❌ Error listing accessible customers:", error);
+    }
+}
+
+/**
  * Runs a GAQL query and displays results with performance metrics
  */
 async function runGaqlQuery(gaqlQuery: string): Promise<void> {
     try {
         const client = initializeClient();
-        const customer = client.Customer({
-            customer_id: config.login_customer_id!,
-            refresh_token: config.refresh_token!,
-            login_customer_id: config.login_customer_id,
-        });
+        const customer = createCustomerInstance(client);
 
         console.log("\nRunning query...");
+        console.log(`Using customer ID: ${config.customer_id}`);
+
+        if (config.login_customer_id) {
+            console.log(`Using login customer ID: ${config.login_customer_id}`);
+        }
 
         // Execute the query
         const results = await customer.query(gaqlQuery);
@@ -299,6 +356,203 @@ async function runGaqlQuery(gaqlQuery: string): Promise<void> {
 }
 
 /**
+ * Updates a conversion action's status from HIDDEN to ENABLED
+ * @param conversionActionId The ID of the conversion action to update
+ */
+async function updateConversionActionStatus(conversionActionId: string): Promise<void> {
+    try {
+        const client = initializeClient();
+        const customer = createCustomerInstance(client);
+
+        console.log("\nUpdating conversion action status...");
+        console.log(`Using customer ID: ${config.customer_id}`);
+
+        if (config.login_customer_id) {
+            console.log(`Using login customer ID: ${config.login_customer_id}`);
+        }
+
+        // Create the resource name
+        const resourceName = `customers/${config.customer_id}/conversionActions/${conversionActionId}`;
+
+        // Create the update operation
+        const operation = {
+            update: {
+                resource_name: resourceName,
+                status: "ENABLED", // Set the status to ENABLED
+            },
+            update_mask: {
+                paths: ["status"], // Only update the status field
+            },
+        };
+
+        // Call the ConversionActionService mutate method
+        // Use the conversion action service properly
+        const response = await customer.conversionActions.update([
+            {
+                resource_name: resourceName,
+                status: "ENABLED",
+            },
+        ]);
+
+        if (response && response.results && response.results.length > 0) {
+            console.log(`\n✅ Successfully updated conversion action status to ENABLED:`);
+            console.log(`Resource Name: ${response.results[0].resource_name}`);
+        } else {
+            console.log("\n⚠️ Update operation completed but no results returned.");
+        }
+    } catch (error) {
+        console.error("\n❌ Error updating conversion action status:", error);
+        if (error instanceof Error) {
+            console.error(`Error details: ${error.message}`);
+        }
+    }
+}
+
+/**
+ * Lists conversion actions for the current customer account
+ */
+async function listConversionActions(): Promise<void> {
+    try {
+        const client = initializeClient();
+        const customer = createCustomerInstance(client);
+
+        console.log("\nListing conversion actions...");
+        console.log(`Using customer ID: ${config.customer_id}`);
+
+        // Query to get all conversion actions with their IDs and status
+        const query = `
+            SELECT
+                conversion_action.id,
+                conversion_action.name,
+                conversion_action.status,
+                conversion_action.type
+            FROM conversion_action
+            ORDER BY conversion_action.id
+        `;
+
+        // Execute the query
+        const results = await customer.query(query);
+
+        if (results && results.length > 0) {
+            console.log(`\n✅ Found ${results.length} conversion actions:`);
+
+            // Display the results in a table format
+            const formattedResults = results.map((result) => {
+                // Check if conversion_action exists before accessing properties
+                if (result.conversion_action) {
+                    return {
+                        ID: result.conversion_action.id || "N/A",
+                        Name: result.conversion_action.name || "N/A",
+                        Status: result.conversion_action.status || "N/A",
+                        Type: result.conversion_action.type || "N/A",
+                    };
+                }
+                return {
+                    ID: "N/A",
+                    Name: "N/A",
+                    Status: "N/A",
+                    Type: "N/A",
+                };
+            });
+
+            console.table(formattedResults);
+
+            return;
+        } else {
+            console.log("\n⚠️ No conversion actions found.");
+        }
+    } catch (error) {
+        console.error("\n❌ Error listing conversion actions:", error);
+    }
+}
+
+/**
+ * Creates a Third-Party App Analytics Link
+ * @param appAnalyticsProviderId The ID of the app analytics provider
+ */
+async function createThirdPartyAppAnalyticsLink(appAnalyticsProviderId: number = 8650286658): Promise<void> {
+    try {
+        const oauth2Client = new OAuth2Client(config.client_id, config.client_secret, "http://localhost:8080");
+
+        console.log("\nCreating Third-Party App Analytics Link...");
+        console.log(`Using customer ID: ${config.customer_id}`);
+
+        if (config.login_customer_id) {
+            console.log(`Using login customer ID: ${config.login_customer_id}`);
+        }
+
+        // Set token with refresh token
+        oauth2Client.setCredentials({
+            refresh_token: config.refresh_token,
+        });
+
+        // Get access token
+        const tokenResponse = await oauth2Client.getAccessToken();
+        const accessToken = tokenResponse.token;
+
+        if (!accessToken) {
+            throw new Error("Failed to obtain access token");
+        }
+
+        // Prepare headers for the request
+        const headers: Record<string, string> = {
+            "Content-Type": "application/json",
+            "developer-token": config.developer_token,
+            Authorization: `Bearer ${accessToken}`,
+        };
+
+        // Add login-customer-id if it exists
+        if (config.login_customer_id) {
+            headers["login-customer-id"] = config.login_customer_id;
+        }
+
+        // Prepare the request body
+        const requestBody = {
+            customer_id: config.customer_id,
+            operations: [
+                {
+                    create: {
+                        identifier: {
+                            app_analytics_provider_id: appAnalyticsProviderId,
+                        },
+                    },
+                },
+            ],
+        };
+
+        // API endpoint URL
+        const url = `https://googleads.google.com/v19/customers/${config.customer_id}/thirdpartyappanalyticslinks:mutate`;
+
+        // Make the API call using fetch
+        const response = await fetch(url, {
+            method: "POST",
+            headers: headers,
+            body: JSON.stringify(requestBody),
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`API request failed with status ${response.status}: ${errorText}`);
+        }
+
+        const responseData = await response.json();
+
+        if (responseData && responseData.results && responseData.results.length > 0) {
+            console.log(`\n✅ Successfully created Third-Party App Analytics Link:`);
+            console.log(JSON.stringify(responseData.results[0], null, 2));
+        } else {
+            console.log("\n⚠️ Operation completed but no results returned.");
+            console.log(JSON.stringify(responseData, null, 2));
+        }
+    } catch (error) {
+        console.error("\n❌ Error creating Third-Party App Analytics Link:", error);
+        if (error instanceof Error) {
+            console.error(`Error details: ${error.message}`);
+        }
+    }
+}
+
+/**
  * Main function to run the tool
  */
 async function main(): Promise<void> {
@@ -311,33 +565,98 @@ async function main(): Promise<void> {
 
     console.log("\n✅ Authentication completed successfully!");
 
-    // Continuous query loop
-    let continueQuerying = true;
+    // Main menu loop
+    let exitProgram = false;
 
-    while (continueQuerying) {
-        // Prompt for GAQL query
-        const gaqlQuery = await new Promise<string>((resolve) => {
-            console.log("\nEnter your GAQL query:");
-            console.log("Example: SELECT campaign.id, campaign.name, metrics.impressions FROM campaign");
-            rl.question("> ", (answer) => {
+    while (!exitProgram) {
+        console.log("\n========================================");
+        console.log("Main Menu");
+        console.log("========================================");
+        console.log("1. List accessible customer accounts");
+        console.log("2. Run GAQL query");
+        console.log("3. List conversion actions");
+        console.log("4. Update conversion action status (HIDDEN → ENABLED)");
+        console.log("5. Create Third-Party App Analytics Link");
+        console.log("6. Exit");
+
+        const choice = await new Promise<string>((resolve) => {
+            rl.question("\nSelect an option (1-6): ", (answer) => {
                 resolve(answer);
             });
         });
 
-        // Run the query
-        await runGaqlQuery(gaqlQuery);
+        switch (choice) {
+            case "1":
+                await listAccessibleCustomers();
+                break;
+            case "2":
+                // Prompt for GAQL query
+                const gaqlQuery = await new Promise<string>((resolve) => {
+                    console.log("\nEnter your GAQL query:");
+                    console.log("Example: SELECT campaign.id, campaign.name, metrics.impressions FROM campaign");
+                    rl.question("> ", (answer) => {
+                        resolve(answer);
+                    });
+                });
+                await runGaqlQuery(gaqlQuery);
+                break;
+            case "3":
+                await listConversionActions();
+                break;
+            case "4":
+                // First list conversion actions to help the user select one
+                await listConversionActions();
 
-        // Ask if user wants to run another query
-        const runAnother = await new Promise<string>((resolve) => {
-            rl.question("\nDo you want to run another query? (yes/no): ", (answer) => {
-                resolve(answer.toLowerCase());
-            });
-        });
+                // Prompt for conversion action ID
+                const conversionActionId = await new Promise<string>((resolve) => {
+                    rl.question(
+                        "\nEnter the ID of the conversion action to update from HIDDEN to ENABLED: ",
+                        (answer) => {
+                            resolve(answer);
+                        }
+                    );
+                });
 
-        continueQuerying = runAnother === "yes" || runAnother === "y";
+                if (conversionActionId) {
+                    await updateConversionActionStatus(conversionActionId);
+                } else {
+                    console.log("\n⚠️ No conversion action ID provided. Operation cancelled.");
+                }
+                break;
+            case "5":
+                // Prompt for app analytics provider ID (optional)
+                const useDefaultProviderId = await new Promise<string>((resolve) => {
+                    rl.question("\nUse default App Analytics Provider ID (8650286658)? (yes/no): ", (answer) => {
+                        resolve(answer.toLowerCase());
+                    });
+                });
+
+                if (useDefaultProviderId === "yes" || useDefaultProviderId === "y") {
+                    await createThirdPartyAppAnalyticsLink();
+                } else {
+                    const providerId = await new Promise<string>((resolve) => {
+                        rl.question("\nEnter the App Analytics Provider ID: ", (answer) => {
+                            resolve(answer);
+                        });
+                    });
+
+                    if (providerId) {
+                        await createThirdPartyAppAnalyticsLink(Number(providerId));
+                    } else {
+                        console.log("\n⚠️ No provider ID provided. Using default (8650286658).");
+                        await createThirdPartyAppAnalyticsLink();
+                    }
+                }
+                break;
+            case "6":
+                exitProgram = true;
+                console.log("\nThank you for using Google Ads API Query Tool!");
+                break;
+            default:
+                console.log("\n⚠️ Invalid option. Please select a number between 1 and 6.");
+        }
     }
 
-    console.log("\nThank you for using Google Ads API Query Tool!");
     rl.close();
 }
 
